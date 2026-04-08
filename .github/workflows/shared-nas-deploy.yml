@@ -192,12 +192,36 @@ jobs:
           docker image prune -af --filter "until=24h" > /dev/null 2>&1 || true
           docker builder prune -af > /dev/null 2>&1 || true
 
+      - name: Capture Error Context
+        id: error_ctx
+        if: failure()
+        run: |
+          CONTAINER="${{ inputs.container_name }}"
+          {
+            echo "=== Container Logs (${CONTAINER}) ==="
+            docker logs "$CONTAINER" --tail 40 2>&1 || echo "(container not running)"
+            echo ""
+            echo "=== Container Status ==="
+            docker ps -a --filter "name=$CONTAINER" --format "{{.Status}}" 2>/dev/null || true
+            echo ""
+            echo "=== Docker Compose Config Validation ==="
+            cd "${{ inputs.compose_dir }}" 2>/dev/null && docker compose config --quiet 2>&1 || echo "(compose validation skipped)"
+          } > /tmp/deploy_error_log.txt 2>&1
+          # GitHub Actions: multi-line output via file
+          {
+            echo "ERROR_LOG<<DEPLOY_ERROR_EOF"
+            head -c 2000 /tmp/deploy_error_log.txt
+            echo ""
+            echo "DEPLOY_ERROR_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Notify Webhook
         if: always()
         env:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_INPUT: ${{ inputs.webhook_url }}
           DEFAULT_WEBHOOK_URL: 'https://os.rosch.co.jp/api/webhooks/incoming/tok_50a8943034a2be536e494485da02e3a7e5c42d4bca42c291'
+          ERROR_LOG: ${{ steps.error_ctx.outputs.ERROR_LOG }}
         run: |
           TARGET_URL="${WEBHOOK_SECRET:-${WEBHOOK_INPUT:-$DEFAULT_WEBHOOK_URL}}"
           if [ -z "$TARGET_URL" ]; then
@@ -205,7 +229,6 @@ jobs:
             exit 0
           fi
 
-          # Project name: "komei-alt/rosch-os" -> "rosch-os"
           REPO_FULL="${{ github.repository }}"
           REPO_NAME="${REPO_FULL##*/}"
           CONTAINER="${{ inputs.container_name }}"
@@ -213,36 +236,51 @@ jobs:
           SHORT_SHA="${COMMIT_SHA:0:7}"
           COMMIT_MSG=$(echo '${{ github.event.head_commit.message }}' | head -1 | cut -c1-80)
           ACTOR="${{ github.actor }}"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
           if [ "${{ job.status }}" = "success" ]; then
-            TEXT="[${REPO_NAME}] デプロイ成功 (${SHORT_SHA})"
-            PAYLOAD=$(cat <<EOF
-          {
-            "text": "${TEXT}",
-            "attachments": [
-              {
-                "color": "#36a64f",
-                "title": "Deploy OK -- ${REPO_NAME}",
-                "text": "${CONTAINER} へのデプロイが完了しました。\n${COMMIT_MSG}\nby ${ACTOR} (${SHORT_SHA})"
-              }
-            ]
-          }
-          EOF
-            )
+            PAYLOAD=$(python3 -c "
+          import json, sys
+          print(json.dumps({
+            'text': '[${REPO_NAME}] Deploy OK (${SHORT_SHA})',
+            'attachments': [{
+              'color': '#36a64f',
+              'title': 'Deploy OK -- ${REPO_NAME}',
+              'text': '${CONTAINER} へのデプロイが完了しました。\n${COMMIT_MSG}\nby ${ACTOR} (${SHORT_SHA})'
+            }]
+          }))
+          ")
           else
-            TEXT="[${REPO_NAME}] デプロイ失敗 (${SHORT_SHA})"
-            PAYLOAD=$(cat <<EOF
-          {
-            "text": "${TEXT}",
-            "attachments": [
+            # Escape error log for JSON
+            ESCAPED_LOG=$(python3 -c "
+          import json, os, sys
+          log = os.environ.get('ERROR_LOG', '(no logs captured)')
+          # Truncate to 1500 chars for notification
+          if len(log) > 1500:
+            log = log[:1500] + '\n... (truncated)'
+          print(json.dumps(log))
+          ")
+
+            PAYLOAD=$(python3 -c "
+          import json, os, sys
+          log = json.loads('''${ESCAPED_LOG}''')
+          data = {
+            'text': '[${REPO_NAME}] Deploy FAILED (${SHORT_SHA})',
+            'attachments': [
               {
-                "color": "#dc3545",
-                "title": "Deploy FAILED -- ${REPO_NAME}",
-                "text": "${CONTAINER} のデプロイに失敗しました。\n${COMMIT_MSG}\nby ${ACTOR} (${SHORT_SHA})"
+                'color': '#dc3545',
+                'title': 'Deploy FAILED -- ${REPO_NAME}',
+                'text': '${CONTAINER} のデプロイに失敗しました。\n${COMMIT_MSG}\nby ${ACTOR} (${SHORT_SHA})\nActions: ${RUN_URL}'
+              },
+              {
+                'color': '#6c757d',
+                'title': 'Error Logs',
+                'text': log
               }
             ]
           }
-          EOF
-            )
+          print(json.dumps(data))
+          ")
           fi
           curl -sS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$TARGET_URL" || echo "Webhook notification failed."
+

@@ -38,6 +38,11 @@ on:
         type: string
         default: "data docker-compose.yml Dockerfile storage .env.production"
         description: "NAS側で上書きせず維持するファイルやディレクトリ（スペース区切り）"
+      deploy_delay:
+        required: false
+        type: number
+        default: 0
+        description: "デバウンス秒数。cancel-in-progress: true と併用すると、push が落ち着いてからデプロイが実行される。0で即時実行。"
       post_build_script:
         required: false
         type: string
@@ -56,6 +61,13 @@ jobs:
     runs-on: [self-hosted, nas]
     timeout-minutes: 30
     steps:
+      - name: Debounce
+        if: ${{ inputs.deploy_delay > 0 }}
+        run: |
+          echo "Waiting ${{ inputs.deploy_delay }}s for push activity to settle..."
+          echo "If a new push arrives, this run will be cancelled (cancel-in-progress)."
+          sleep ${{ inputs.deploy_delay }}
+
       - name: Checkout
         uses: actions/checkout@v4
         with:

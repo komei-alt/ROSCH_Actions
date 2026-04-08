@@ -197,31 +197,52 @@ jobs:
         env:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_INPUT: ${{ inputs.webhook_url }}
+          DEFAULT_WEBHOOK_URL: 'https://os.rosch.co.jp/api/webhooks/incoming/tok_50a8943034a2be536e494485da02e3a7e5c42d4bca42c291'
         run: |
-          TARGET_URL="${WEBHOOK_SECRET:-$WEBHOOK_INPUT}"
+          TARGET_URL="${WEBHOOK_SECRET:-${WEBHOOK_INPUT:-$DEFAULT_WEBHOOK_URL}}"
           if [ -z "$TARGET_URL" ]; then
             echo "No webhook URL configured. Skipping notification."
             exit 0
           fi
-          STATUS="success"
-          COLOR="#36a64f"
-          TITLE="Deployment Successful"
-          if [ "${{ job.status }}" != "success" ]; then
-            STATUS="failure"
-            COLOR="#dc3545"
-            TITLE="Deployment Failed"
-          fi
-          PAYLOAD=$(cat <<EOF
+
+          # Project name: "komei-alt/rosch-os" -> "rosch-os"
+          REPO_FULL="${{ github.repository }}"
+          REPO_NAME="${REPO_FULL##*/}"
+          CONTAINER="${{ inputs.container_name }}"
+          COMMIT_SHA="${{ github.sha }}"
+          SHORT_SHA="${COMMIT_SHA:0:7}"
+          COMMIT_MSG=$(echo '${{ github.event.head_commit.message }}' | head -1 | cut -c1-80)
+          ACTOR="${{ github.actor }}"
+
+          if [ "${{ job.status }}" = "success" ]; then
+            TEXT="[${REPO_NAME}] デプロイ成功 (${SHORT_SHA})"
+            PAYLOAD=$(cat <<EOF
           {
-            "text": "Deploy ${STATUS}: ${{ github.repository }}",
+            "text": "${TEXT}",
             "attachments": [
               {
-                "color": "${COLOR}",
-                "title": "${TITLE}",
-                "text": "Container **${{ inputs.container_name }}** — ${STATUS}"
+                "color": "#36a64f",
+                "title": "Deploy OK -- ${REPO_NAME}",
+                "text": "${CONTAINER} へのデプロイが完了しました。\n${COMMIT_MSG}\nby ${ACTOR} (${SHORT_SHA})"
               }
             ]
           }
           EOF
-          )
+            )
+          else
+            TEXT="[${REPO_NAME}] デプロイ失敗 (${SHORT_SHA})"
+            PAYLOAD=$(cat <<EOF
+          {
+            "text": "${TEXT}",
+            "attachments": [
+              {
+                "color": "#dc3545",
+                "title": "Deploy FAILED -- ${REPO_NAME}",
+                "text": "${CONTAINER} のデプロイに失敗しました。\n${COMMIT_MSG}\nby ${ACTOR} (${SHORT_SHA})"
+              }
+            ]
+          }
+          EOF
+            )
+          fi
           curl -sS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$TARGET_URL" || echo "Webhook notification failed."

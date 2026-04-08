@@ -181,23 +181,35 @@ jobs:
           docker builder prune -af > /dev/null 2>&1 || true
 
       - name: Notify Webhook
-        if: ${{ always() && (inputs.webhook_url != '' || secrets.WEBHOOK_URL != '') }}
+        if: always()
+        env:
+          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_INPUT: ${{ inputs.webhook_url }}
         run: |
+          TARGET_URL="${WEBHOOK_SECRET:-$WEBHOOK_INPUT}"
+          if [ -z "$TARGET_URL" ]; then
+            echo "No webhook URL configured. Skipping notification."
+            exit 0
+          fi
+          STATUS="success"
+          COLOR="#36a64f"
+          TITLE="Deployment Successful"
+          if [ "${{ job.status }}" != "success" ]; then
+            STATUS="failure"
+            COLOR="#dc3545"
+            TITLE="Deployment Failed"
+          fi
           PAYLOAD=$(cat <<EOF
           {
-            "text": "🚀 Deploy Completed: ${{ github.repository }}",
+            "text": "Deploy ${STATUS}: ${{ github.repository }}",
             "attachments": [
               {
-                "color": "#36a64f",
-                "title": "Deployment Successful",
-                "text": "Container **${{ inputs.container_name }}** has been updated and passed health checks."
+                "color": "${COLOR}",
+                "title": "${TITLE}",
+                "text": "Container **${{ inputs.container_name }}** — ${STATUS}"
               }
             ]
           }
           EOF
           )
-          TARGET_URL="${{ secrets.WEBHOOK_URL }}"
-          if [ -z "$TARGET_URL" ]; then
-            TARGET_URL="${{ inputs.webhook_url }}"
-          fi
-          curl -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$TARGET_URL" || echo "Webhook notification failed."
+          curl -sS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$TARGET_URL" || echo "Webhook notification failed."

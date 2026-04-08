@@ -63,28 +63,20 @@ jobs:
         if: ${{ inputs.pre_deploy_script != '' }}
         run: ${{ inputs.pre_deploy_script }}
 
-      - name: Deploy to NAS
+      - name: Ensure Disk Space
         run: |
           DEPLOY_DIR="${{ inputs.deploy_dir }}"
-          COMPOSE_DIR="${{ inputs.compose_dir }}"
-          HEALTH_URL="${{ inputs.health_url }}"
-          CONTAINER_NAME="${{ inputs.container_name }}"
-          PRESERVE_FILES="${{ inputs.preserve_files }}"
-
-          echo "=== Deploy Start (Unified Shared Workflow) ==="
-          
-          # 1. Check Disk Space and cleanup if needed
-          echo "Step 1: Disk space check"
           FREE_MB=$(df -m "$DEPLOY_DIR" 2>/dev/null | awk 'NR==2{print $4}')
           if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt 2048 ]; then
               echo "WARNING: Low disk space (${FREE_MB}MB free). Running cleanup..."
               docker system prune -af --volumes --filter "until=24h" > /dev/null 2>&1 || true
               docker builder prune -af > /dev/null 2>&1 || true
           fi
-          
-          # 2. Sync files 
-          echo "Step 2: Syncing files to $DEPLOY_DIR"
-          # Evaluate sync_excludes securely using eval so flags are passed correctly
+
+      - name: Sync Code
+        run: |
+          DEPLOY_DIR="${{ inputs.deploy_dir }}"
+          PRESERVE_FILES="${{ inputs.preserve_files }}"
           eval "tar cf - ${{ inputs.sync_excludes }} ." | \
           docker run --rm -i \
             -e PRESERVE="$PRESERVE_FILES" \
@@ -100,50 +92,42 @@ jobs:
                 [ -e "/tmp/_p_$f" ] && cp -a "/tmp/_p_$f" "/deploy/$f" 2>/dev/null || true
               done
             '
-          echo "Sync OK"
 
-          # 3. Docker build (Zero downtime prep)
-          echo "Step 3: Docker Build (Pre-caching before swap)"
-          cd "$COMPOSE_DIR"
-          docker compose build
-          echo "Build Complete"
+      - name: Docker Build
+        working-directory: ${{ inputs.compose_dir }}
+        run: docker compose build
 
-          # 4. Post-build script (Migrations, etc)
-          if [ -n "${{ inputs.post_build_script }}" ]; then
-            echo "Step 4: Running post-build script"
-            eval "${{ inputs.post_build_script }}"
-          fi
+      - name: Post-build Script (Migrations)
+        if: ${{ inputs.post_build_script != '' }}
+        working-directory: ${{ inputs.compose_dir }}
+        run: ${{ inputs.post_build_script }}
 
-          # 5. Docker Swap (Down then Up to prevent network dangling)
-          echo "Step 5: Docker Container Swap"
+      - name: Swap Container (Clean Network)
+        working-directory: ${{ inputs.compose_dir }}
+        run: |
           docker compose down
           docker compose up -d
-          echo "Container Swapped"
 
-          # 6. Aggressive Cleanup (Garbage Collection)
-          echo "Step 6: Cleanup"
+      - name: Garbage Collection
+        run: |
           docker container prune -f > /dev/null 2>&1 || true
           docker image prune -af > /dev/null 2>&1 || true
           docker builder prune -af > /dev/null 2>&1 || true
 
-          # 7. Health check
-          if [ -n "$HEALTH_URL" ]; then
-            echo "Step 7: Health check"
-            for i in 1 2 3 4 5 6; do
-              sleep 5
-              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
-              if [ "$HTTP_STATUS" = "200" ]; then
-                echo "Health check OK (HTTP $HTTP_STATUS, attempt $i)"
-                echo "=== Deploy Complete ==="
-                exit 0
-              fi
-              echo "Health check attempt $i: HTTP $HTTP_STATUS"
-            done
-            echo "WARNING: Health check failed after 30s"
-            docker logs "$CONTAINER_NAME" --tail 20
-            exit 1
-          else
-            echo "Step 7: No health URL provided. Skipping check."
-          fi
-          
-          echo "=== Deploy Complete ==="
+      - name: Health Check
+        if: ${{ inputs.health_url != '' }}
+        run: |
+          HEALTH_URL="${{ inputs.health_url }}"
+          CONTAINER_NAME="${{ inputs.container_name }}"
+          for i in 1 2 3 4 5 6; do
+            sleep 5
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Health check OK (HTTP $HTTP_STATUS, attempt $i)"
+              exit 0
+            fi
+            echo "Health check attempt $i: HTTP $HTTP_STATUS"
+          done
+          echo "WARNING: Health check failed after 30s"
+          docker logs "$CONTAINER_NAME" --tail 20
+          exit 1

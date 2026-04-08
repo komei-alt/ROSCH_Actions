@@ -6,11 +6,11 @@ on:
       deploy_dir:
         required: true
         type: string
-        description: "パス: デプロイ先のディレクトリ (例: /volume1/docker/rosch-craft/app)"
+        description: "パス: デプロイ先のディレクトリ (例: /volume1/docker/rosch-os)"
       compose_dir:
         required: true
         type: string
-        description: "パス: docker-compose が実行されるディレクトリ (例: /volume1/docker/rosch-craft)"
+        description: "パス: docker-compose が実行されるディレクトリ (例: /volume1/docker/rosch-os)"
       container_name:
         required: true
         type: string
@@ -27,12 +27,26 @@ on:
       pre_deploy_script:
         required: false
         type: string
-        description: "デプロイ前（Dockerビルド前）に実行するスクリプト (例: node scripts/generate-changelog.js)"
+        description: "デプロイ前（Dockerビルド・Sync前）に実行するスクリプト"
+      sync_excludes:
+        required: false
+        type: string
+        default: "--exclude='node_modules' --exclude='data' --exclude='.git' --exclude='.DS_Store' --exclude='PLAN' --exclude='DOCUMENT'"
+        description: "tar同期時の除外オプション"
+      preserve_files:
+        required: false
+        type: string
+        default: "data docker-compose.yml Dockerfile storage .env.production"
+        description: "NAS側で上書きせず維持するファイルやディレクトリ（スペース区切り）"
+      post_build_script:
+        required: false
+        type: string
+        description: "Dockerのビルド後（ダウンタイム前）の実行スクリプト (例: DBマイグレーションなど)"
 
 jobs:
   deploy:
     runs-on: [self-hosted, nas]
-    timeout-minutes: 15
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -55,44 +69,66 @@ jobs:
           COMPOSE_DIR="${{ inputs.compose_dir }}"
           HEALTH_URL="${{ inputs.health_url }}"
           CONTAINER_NAME="${{ inputs.container_name }}"
+          PRESERVE_FILES="${{ inputs.preserve_files }}"
 
-          echo "=== Deploy Start ==="
+          echo "=== Deploy Start (Unified Shared Workflow) ==="
           
-          # 1. Sync files 
-          echo "Step 1: Syncing files to $DEPLOY_DIR"
-          tar cf - \
-            --exclude='node_modules' \
-            --exclude='data' \
-            --exclude='.git' \
-            --exclude='.DS_Store' \
-            . | \
+          # 1. Check Disk Space and cleanup if needed
+          echo "Step 1: Disk space check"
+          FREE_MB=$(df -m "$DEPLOY_DIR" 2>/dev/null | awk 'NR==2{print $4}')
+          if [ -n "$FREE_MB" ] && [ "$FREE_MB" -lt 2048 ]; then
+              echo "WARNING: Low disk space (${FREE_MB}MB free). Running cleanup..."
+              docker system prune -af --volumes --filter "until=24h" > /dev/null 2>&1 || true
+              docker builder prune -af > /dev/null 2>&1 || true
+          fi
+          
+          # 2. Sync files 
+          echo "Step 2: Syncing files to $DEPLOY_DIR"
+          # Evaluate sync_excludes securely using eval so flags are passed correctly
+          eval "tar cf - ${{ inputs.sync_excludes }} ." | \
           docker run --rm -i \
+            -e PRESERVE="$PRESERVE_FILES" \
             -v "$DEPLOY_DIR":/deploy \
             alpine sh -c '
               cd /deploy
-              # Preserve data and config
-              for f in data docker-compose.yml Dockerfile; do
+              for f in $PRESERVE; do
                 [ -e "$f" ] && cp -a "$f" "/tmp/_p_$f" 2>/dev/null || true
               done
               rm -rf /deploy/*
               tar xf - -C /deploy
-              for f in data docker-compose.yml Dockerfile; do
+              for f in $PRESERVE; do
                 [ -e "/tmp/_p_$f" ] && cp -a "/tmp/_p_$f" "/deploy/$f" 2>/dev/null || true
               done
             '
           echo "Sync OK"
 
-          # 2. Docker recreations (with network cleanup)
-          echo "Step 2: Docker recreate"
+          # 3. Docker build (Zero downtime prep)
+          echo "Step 3: Docker Build (Pre-caching before swap)"
           cd "$COMPOSE_DIR"
-          # 一旦 down して再構築することで、古いネットワークエンドポイントの残存エラーを防ぐ
-          docker compose down
-          docker compose up -d --build
-          echo "Container recreated"
+          docker compose build
+          echo "Build Complete"
 
-          # 3. Health check
+          # 4. Post-build script (Migrations, etc)
+          if [ -n "${{ inputs.post_build_script }}" ]; then
+            echo "Step 4: Running post-build script"
+            eval "${{ inputs.post_build_script }}"
+          fi
+
+          # 5. Docker Swap (Down then Up to prevent network dangling)
+          echo "Step 5: Docker Container Swap"
+          docker compose down
+          docker compose up -d
+          echo "Container Swapped"
+
+          # 6. Aggressive Cleanup (Garbage Collection)
+          echo "Step 6: Cleanup"
+          docker container prune -f > /dev/null 2>&1 || true
+          docker image prune -af > /dev/null 2>&1 || true
+          docker builder prune -af > /dev/null 2>&1 || true
+
+          # 7. Health check
           if [ -n "$HEALTH_URL" ]; then
-            echo "Step 3: Health check"
+            echo "Step 7: Health check"
             for i in 1 2 3 4 5 6; do
               sleep 5
               HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
@@ -107,7 +143,7 @@ jobs:
             docker logs "$CONTAINER_NAME" --tail 20
             exit 1
           else
-            echo "Step 3: No health URL provided. Skipping health check."
+            echo "Step 7: No health URL provided. Skipping check."
           fi
           
           echo "=== Deploy Complete ==="

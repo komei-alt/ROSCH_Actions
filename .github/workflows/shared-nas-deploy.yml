@@ -45,6 +45,10 @@ on:
       webhook_url:
         required: false
         type: string
+        description: "※非推奨(Secrets推奨) Slack互換の通知用 Webhook URL。デプロイ完了時に通知を送信します。"
+    secrets:
+      WEBHOOK_URL:
+        required: false
         description: "Slack互換の通知用 Webhook URL。デプロイ完了時に通知を送信します。"
 
 jobs:
@@ -177,7 +181,7 @@ jobs:
           docker builder prune -af > /dev/null 2>&1 || true
 
       - name: Notify Webhook
-        if: ${{ inputs.webhook_url != '' }}
+        if: inputs.webhook_url != '' || secrets.WEBHOOK_URL != ''
         run: |
           PAYLOAD=$(cat <<EOF
           {
@@ -192,4 +196,8 @@ jobs:
           }
           EOF
           )
-          curl -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "${{ inputs.webhook_url }}" || echo "Webhook notification failed."
+          TARGET_URL="${{ secrets.WEBHOOK_URL }}"
+          if [ -z "$TARGET_URL" ]; then
+            TARGET_URL="${{ inputs.webhook_url }}"
+          fi
+          curl -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$TARGET_URL" || echo "Webhook notification failed."

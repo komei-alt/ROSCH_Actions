@@ -42,6 +42,10 @@ on:
         required: false
         type: string
         description: "Dockerのビルド後（ダウンタイム前）の実行スクリプト (例: DBマイグレーションなど)"
+      webhook_url:
+        required: false
+        type: string
+        description: "Slack互換の通知用 Webhook URL。デプロイ完了時に通知を送信します。"
 
 jobs:
   deploy:
@@ -131,3 +135,21 @@ jobs:
           echo "WARNING: Health check failed after 30s"
           docker logs "$CONTAINER_NAME" --tail 20
           exit 1
+
+      - name: Notify Webhook
+        if: ${{ inputs.webhook_url != '' }}
+        run: |
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "🚀 Deploy Completed: ${{ github.repository }}",
+            "attachments": [
+              {
+                "color": "#36a64f",
+                "title": "Deployment Successful",
+                "text": "Container **${{ inputs.container_name }}** has been updated and passed health checks."
+              }
+            ]
+          }
+          EOF
+          )
+          curl -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "${{ inputs.webhook_url }}" || echo "Webhook notification failed."

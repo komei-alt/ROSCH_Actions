@@ -181,7 +181,7 @@ jobs:
           docker builder prune -af > /dev/null 2>&1 || true
 
       - name: Notify Webhook
-        if: inputs.webhook_url != '' || secrets.WEBHOOK_URL != ''
+        if: ${{ always() && (inputs.webhook_url != '' || secrets.WEBHOOK_URL != '') }}
         run: |
           PAYLOAD=$(cat <<EOF
           {

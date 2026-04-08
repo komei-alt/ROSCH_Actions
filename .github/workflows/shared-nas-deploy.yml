@@ -87,15 +87,36 @@ jobs:
             -v "$DEPLOY_DIR":/deploy \
             alpine sh -c '
               cd /deploy
+              # Preserve: save specified files (supports nested paths)
               for f in $PRESERVE; do
-                [ -e "$f" ] && cp -a "$f" "/tmp/_p_$f" 2>/dev/null || true
+                if [ -e "$f" ]; then
+                  mkdir -p "$(dirname "/tmp/_preserve/$f")"
+                  cp -a "$f" "/tmp/_preserve/$f"
+                fi
               done
-              rm -rf /deploy/*
+              # Clean: remove all files including dotfiles
+              find /deploy -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+              # Extract new code
               tar xf - -C /deploy
+              # Restore preserved files
               for f in $PRESERVE; do
-                [ -e "/tmp/_p_$f" ] && cp -a "/tmp/_p_$f" "/deploy/$f" 2>/dev/null || true
+                if [ -e "/tmp/_preserve/$f" ]; then
+                  mkdir -p "$(dirname "/deploy/$f")"
+                  cp -a "/tmp/_preserve/$f" "/deploy/$f"
+                fi
               done
             '
+
+      - name: Save Rollback Images
+        working-directory: ${{ inputs.compose_dir }}
+        run: |
+          # Tag current images as :rollback before building new ones
+          for img in $(docker compose config --images 2>/dev/null); do
+            if docker image inspect "$img" > /dev/null 2>&1; then
+              docker tag "$img" "${img%:*}:rollback" 2>/dev/null || true
+              echo "Saved rollback: ${img%:*}:rollback"
+            fi
+          done
 
       - name: Docker Build
         working-directory: ${{ inputs.compose_dir }}
@@ -112,29 +133,48 @@ jobs:
           docker compose down
           docker compose up -d
 
-      - name: Garbage Collection
-        run: |
-          docker container prune -f > /dev/null 2>&1 || true
-          docker image prune -af > /dev/null 2>&1 || true
-          docker builder prune -af > /dev/null 2>&1 || true
-
       - name: Health Check
         if: ${{ inputs.health_url != '' }}
+        working-directory: ${{ inputs.compose_dir }}
         run: |
           HEALTH_URL="${{ inputs.health_url }}"
           CONTAINER_NAME="${{ inputs.container_name }}"
           for i in 1 2 3 4 5 6; do
             sleep 5
-            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+            HTTP_STATUS=$(curl -sL -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
             if [ "$HTTP_STATUS" = "200" ]; then
               echo "Health check OK (HTTP $HTTP_STATUS, attempt $i)"
               exit 0
             fi
             echo "Health check attempt $i: HTTP $HTTP_STATUS"
           done
-          echo "WARNING: Health check failed after 30s"
-          docker logs "$CONTAINER_NAME" --tail 20
+          echo "ERROR: Health check failed after 30s"
+          docker logs "$CONTAINER_NAME" --tail 30
+
+          # Rollback: restore previous images and restart
+          echo "--- Rollback: restoring previous images ---"
+          ROLLED_BACK=false
+          for img in $(docker compose config --images 2>/dev/null); do
+            ROLLBACK_TAG="${img%:*}:rollback"
+            if docker image inspect "$ROLLBACK_TAG" > /dev/null 2>&1; then
+              docker tag "$ROLLBACK_TAG" "$img" 2>/dev/null || true
+              ROLLED_BACK=true
+              echo "Restored: $img from $ROLLBACK_TAG"
+            fi
+          done
+          if [ "$ROLLED_BACK" = true ]; then
+            docker compose down
+            docker compose up -d
+            echo "Rollback complete. Previous version restored."
+          fi
           exit 1
+
+      - name: Garbage Collection
+        run: |
+          docker container prune -f > /dev/null 2>&1 || true
+          # Keep images from last 24h to preserve rollback tags and other project caches
+          docker image prune -af --filter "until=24h" > /dev/null 2>&1 || true
+          docker builder prune -af > /dev/null 2>&1 || true
 
       - name: Notify Webhook
         if: ${{ inputs.webhook_url != '' }}

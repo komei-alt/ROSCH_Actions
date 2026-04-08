@@ -1,0 +1,113 @@
+name: Shared NAS Deploy
+
+on:
+  workflow_call:
+    inputs:
+      deploy_dir:
+        required: true
+        type: string
+        description: "パス: デプロイ先のディレクトリ (例: /volume1/docker/rosch-craft/app)"
+      compose_dir:
+        required: true
+        type: string
+        description: "パス: docker-compose が実行されるディレクトリ (例: /volume1/docker/rosch-craft)"
+      container_name:
+        required: true
+        type: string
+        description: "ログ取得用のコンテナ名"
+      health_url:
+        required: false
+        type: string
+        description: "ヘルスチェックURL。指定しない場合はスキップ。"
+      setup_node:
+        required: false
+        type: boolean
+        default: false
+        description: "Node.js (v20) のセットアップを行うか"
+      pre_deploy_script:
+        required: false
+        type: string
+        description: "デプロイ前（Dockerビルド前）に実行するスクリプト (例: node scripts/generate-changelog.js)"
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, nas]
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        if: ${{ inputs.setup_node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Pre-deploy Script
+        if: ${{ inputs.pre_deploy_script != '' }}
+        run: ${{ inputs.pre_deploy_script }}
+
+      - name: Deploy to NAS
+        run: |
+          DEPLOY_DIR="${{ inputs.deploy_dir }}"
+          COMPOSE_DIR="${{ inputs.compose_dir }}"
+          HEALTH_URL="${{ inputs.health_url }}"
+          CONTAINER_NAME="${{ inputs.container_name }}"
+
+          echo "=== Deploy Start ==="
+          
+          # 1. Sync files 
+          echo "Step 1: Syncing files to $DEPLOY_DIR"
+          tar cf - \
+            --exclude='node_modules' \
+            --exclude='data' \
+            --exclude='.git' \
+            --exclude='.DS_Store' \
+            . | \
+          docker run --rm -i \
+            -v "$DEPLOY_DIR":/deploy \
+            alpine sh -c '
+              cd /deploy
+              # Preserve data and config
+              for f in data docker-compose.yml Dockerfile; do
+                [ -e "$f" ] && cp -a "$f" "/tmp/_p_$f" 2>/dev/null || true
+              done
+              rm -rf /deploy/*
+              tar xf - -C /deploy
+              for f in data docker-compose.yml Dockerfile; do
+                [ -e "/tmp/_p_$f" ] && cp -a "/tmp/_p_$f" "/deploy/$f" 2>/dev/null || true
+              done
+            '
+          echo "Sync OK"
+
+          # 2. Docker recreations (with network cleanup)
+          echo "Step 2: Docker recreate"
+          cd "$COMPOSE_DIR"
+          # 一旦 down して再構築することで、古いネットワークエンドポイントの残存エラーを防ぐ
+          docker compose down
+          docker compose up -d --build
+          echo "Container recreated"
+
+          # 3. Health check
+          if [ -n "$HEALTH_URL" ]; then
+            echo "Step 3: Health check"
+            for i in 1 2 3 4 5 6; do
+              sleep 5
+              HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
+              if [ "$HTTP_STATUS" = "200" ]; then
+                echo "Health check OK (HTTP $HTTP_STATUS, attempt $i)"
+                echo "=== Deploy Complete ==="
+                exit 0
+              fi
+              echo "Health check attempt $i: HTTP $HTTP_STATUS"
+            done
+            echo "WARNING: Health check failed after 30s"
+            docker logs "$CONTAINER_NAME" --tail 20
+            exit 1
+          else
+            echo "Step 3: No health URL provided. Skipping health check."
+          fi
+          
+          echo "=== Deploy Complete ==="

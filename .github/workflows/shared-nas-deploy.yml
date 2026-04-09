@@ -220,7 +220,7 @@ jobs:
         env:
           WEBHOOK_SECRET: ${{ secrets.WEBHOOK_URL }}
           WEBHOOK_INPUT: ${{ inputs.webhook_url }}
-          DEFAULT_WEBHOOK_URL: 'https://os.rosch.co.jp/api/webhooks/incoming/tok_50a8943034a2be536e494485da02e3a7e5c42d4bca42c291'
+          DEFAULT_WEBHOOK_URL: 'https://os.rosch.co.jp/api/webhooks/incoming/tok_85e2f7c2f5bc4c7e7399b426ee09f067e430c4fa4ef3fd64'
           ERROR_LOG: ${{ steps.error_ctx.outputs.ERROR_LOG }}
         run: |
           TARGET_URL="${WEBHOOK_SECRET:-${WEBHOOK_INPUT:-$DEFAULT_WEBHOOK_URL}}"

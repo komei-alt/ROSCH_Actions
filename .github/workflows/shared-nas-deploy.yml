@@ -222,6 +222,13 @@ jobs:
           WEBHOOK_INPUT: ${{ inputs.webhook_url }}
           DEFAULT_WEBHOOK_URL: 'https://os.rosch.co.jp/api/webhooks/incoming/tok_85e2f7c2f5bc4c7e7399b426ee09f067e430c4fa4ef3fd64'
           ERROR_LOG: ${{ steps.error_ctx.outputs.ERROR_LOG }}
+          DEPLOY_REPO: ${{ github.repository }}
+          DEPLOY_CONTAINER: ${{ inputs.container_name }}
+          DEPLOY_SHA: ${{ github.sha }}
+          DEPLOY_ACTOR: ${{ github.actor }}
+          DEPLOY_RUN_ID: ${{ github.run_id }}
+          DEPLOY_STATUS: ${{ job.status }}
+          DEPLOY_COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
           TARGET_URL="${WEBHOOK_SECRET:-${WEBHOOK_INPUT:-$DEFAULT_WEBHOOK_URL}}"
           if [ -z "$TARGET_URL" ]; then
@@ -229,58 +236,47 @@ jobs:
             exit 0
           fi
 
-          REPO_FULL="${{ github.repository }}"
-          REPO_NAME="${REPO_FULL##*/}"
-          CONTAINER="${{ inputs.container_name }}"
-          COMMIT_SHA="${{ github.sha }}"
-          SHORT_SHA="${COMMIT_SHA:0:7}"
-          COMMIT_MSG=$(echo '${{ github.event.head_commit.message }}' | head -1 | cut -c1-80)
-          ACTOR="${{ github.actor }}"
-          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          PAYLOAD=$(python3 -c "
+          import json, os
 
-          if [ "${{ job.status }}" = "success" ]; then
-            PAYLOAD=$(python3 -c "
-          import json, sys
-          print(json.dumps({
-            'text': '[${REPO_NAME}] Deploy OK (${SHORT_SHA})',
-            'attachments': [{
-              'color': '#36a64f',
-              'title': 'Deploy OK -- ${REPO_NAME}',
-              'text': '${CONTAINER} へのデプロイが完了しました。\n${COMMIT_MSG}\nby ${ACTOR} (${SHORT_SHA})'
-            }]
-          }))
-          ")
-          else
-            # Escape error log for JSON
-            ESCAPED_LOG=$(python3 -c "
-          import json, os, sys
-          log = os.environ.get('ERROR_LOG', '(no logs captured)')
-          # Truncate to 1500 chars for notification
-          if len(log) > 1500:
-            log = log[:1500] + '\n... (truncated)'
-          print(json.dumps(log))
-          ")
+          repo = os.environ['DEPLOY_REPO']
+          repo_name = repo.split('/')[-1]
+          container = os.environ['DEPLOY_CONTAINER']
+          short_sha = os.environ['DEPLOY_SHA'][:7]
+          actor = os.environ['DEPLOY_ACTOR']
+          run_url = f'https://github.com/{repo}/actions/runs/{os.environ[\"DEPLOY_RUN_ID\"]}'
+          commit_msg = os.environ.get('DEPLOY_COMMIT_MSG', '').split('\n')[0][:80]
+          status = os.environ['DEPLOY_STATUS']
 
-            PAYLOAD=$(python3 -c "
-          import json, os, sys
-          log = json.loads('''${ESCAPED_LOG}''')
-          data = {
-            'text': '[${REPO_NAME}] Deploy FAILED (${SHORT_SHA})',
-            'attachments': [
-              {
-                'color': '#dc3545',
-                'title': 'Deploy FAILED -- ${REPO_NAME}',
-                'text': '${CONTAINER} のデプロイに失敗しました。\n${COMMIT_MSG}\nby ${ACTOR} (${SHORT_SHA})\nActions: ${RUN_URL}'
-              },
-              {
-                'color': '#6c757d',
-                'title': 'Error Logs',
-                'text': log
+          if status == 'success':
+              data = {
+                  'text': f'[{repo_name}] Deploy OK ({short_sha})',
+                  'attachments': [{
+                      'color': '#36a64f',
+                      'title': f'Deploy OK -- {repo_name}',
+                      'text': f'{repo_name} へのデプロイが完了しました。\n{commit_msg}\nby {actor} ({short_sha})'
+                  }]
               }
-            ]
-          }
-          print(json.dumps(data))
+          else:
+              error_log = os.environ.get('ERROR_LOG', '') or '(no logs captured)'
+              if len(error_log) > 1500:
+                  error_log = error_log[:1500] + '\n... (truncated)'
+              data = {
+                  'text': f'[{repo_name}] Deploy FAILED ({short_sha})',
+                  'attachments': [
+                      {
+                          'color': '#dc3545',
+                          'title': f'Deploy FAILED -- {repo_name}',
+                          'text': f'{repo_name} のデプロイに失敗しました。\n{commit_msg}\nby {actor} ({short_sha})\nActions: {run_url}'
+                      },
+                      {
+                          'color': '#6c757d',
+                          'title': 'Error Logs',
+                          'text': error_log
+                      }
+                  ]
+              }
+          print(json.dumps(data, ensure_ascii=False))
           ")
-          fi
           curl -sS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$TARGET_URL" || echo "Webhook notification failed."
 

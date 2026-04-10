@@ -50,21 +50,18 @@ on:
       webhook_url:
         required: false
         type: string
-        description: "【非推奨: secrets.WEBHOOK_URL を使用してください】Slack互換の通知用 Webhook URL。"
+        description: "通知用 Webhook URL。未指定時はデフォルト（ROSCH OS Incoming Webhook）に送信。"
     secrets:
       WEBHOOK_URL:
         required: false
-        description: "Slack互換の通知用 Webhook URL。デプロイ完了時に通知を送信します。"
-      ROSCH_DEFAULT_WEBHOOK_URL:
-        required: false
-        description: "Organization デフォルトの Webhook URL。個別の WEBHOOK_URL が未設定時にフォールバックします。"
+        description: "通知用 Webhook URL (Secret)。inputs.webhook_url より優先。"
 
 jobs:
   deploy:
     runs-on: [self-hosted, nas]
     timeout-minutes: 30
     steps:
-      # ─── Phase: Setup ────────────────────────────────────────
+      # --- Phase: Setup ---
       - name: Debounce
         if: ${{ inputs.deploy_delay > 0 }}
         run: |
@@ -87,7 +84,7 @@ jobs:
         if: ${{ inputs.pre_deploy_script != '' }}
         run: ${{ inputs.pre_deploy_script }}
 
-      # ─── Phase: Sync & Build ─────────────────────────────────
+      # --- Phase: Sync & Build ---
       - name: Ensure Disk Space
         run: |
           DEPLOY_DIR="${{ inputs.deploy_dir }}"
@@ -147,14 +144,14 @@ jobs:
         working-directory: ${{ inputs.compose_dir }}
         run: ${{ inputs.post_build_script }}
 
-      # ─── Phase: Deploy ───────────────────────────────────────
+      # --- Phase: Deploy ---
       - name: Swap Container
         working-directory: ${{ inputs.compose_dir }}
         run: |
           docker compose down
           docker compose up -d
 
-      # ─── Phase: Verify ──────────────────────────────────────
+      # --- Phase: Verify ---
       - name: Health Check
         id: health
         if: ${{ inputs.health_url != '' }}
@@ -204,7 +201,7 @@ jobs:
             echo "WARNING: No rollback images found. Manual intervention required."
           fi
 
-      # ─── Phase: Cleanup & Notify ─────────────────────────────
+      # --- Phase: Cleanup & Notify ---
       - name: Garbage Collection
         if: always()
         run: |
@@ -237,13 +234,55 @@ jobs:
       - name: Notify Webhook
         if: always()
         env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL || inputs.webhook_url || secrets.ROSCH_DEFAULT_WEBHOOK_URL }}
-          ERROR_LOG: ${{ steps.error_ctx.outputs.ERROR_LOG }}
+          DEPLOY_STATUS: ${{ job.status }}
           DEPLOY_REPO: ${{ github.repository }}
           DEPLOY_CONTAINER: ${{ inputs.container_name }}
           DEPLOY_SHA: ${{ github.sha }}
           DEPLOY_ACTOR: ${{ github.actor }}
           DEPLOY_RUN_ID: ${{ github.run_id }}
-          DEPLOY_STATUS: ${{ job.status }}
           DEPLOY_COMMIT_MSG: ${{ github.event.head_commit.message }}
-        run: python3 .github/scripts/deploy-notify.py
+          ERROR_LOG: ${{ steps.error_ctx.outputs.ERROR_LOG }}
+        run: |
+          # --- Webhook URL 解決 (優先順: Secret > Input > デフォルト) ---
+          WEBHOOK_URL="${{ secrets.WEBHOOK_URL }}"
+          if [ -z "$WEBHOOK_URL" ]; then
+            WEBHOOK_URL="${{ inputs.webhook_url }}"
+          fi
+          if [ -z "$WEBHOOK_URL" ]; then
+            WEBHOOK_URL="https://os.rosch.co.jp/api/webhooks/incoming/tok_50a8943034a2be536e494485da02e3a7e5c42d4bca42c291"
+          fi
+
+          REPO_NAME="${DEPLOY_REPO##*/}"
+          SHORT_SHA="${DEPLOY_SHA:0:7}"
+          COMMIT_LINE=$(echo "$DEPLOY_COMMIT_MSG" | head -1 | cut -c1-80)
+          RUN_URL="https://github.com/${DEPLOY_REPO}/actions/runs/${DEPLOY_RUN_ID}"
+
+          if [ "$DEPLOY_STATUS" = "success" ]; then
+            COLOR="#36a64f"
+            TITLE="Deploy OK -- ${REPO_NAME}"
+            BODY="${REPO_NAME} へのデプロイが完了しました。\n${COMMIT_LINE}\nby ${DEPLOY_ACTOR} (${SHORT_SHA})"
+          else
+            COLOR="#dc3545"
+            TITLE="Deploy FAILED -- ${REPO_NAME}"
+            BODY="${REPO_NAME} のデプロイに失敗しました。\n${COMMIT_LINE}\nby ${DEPLOY_ACTOR} (${SHORT_SHA})\nActions: ${RUN_URL}"
+          fi
+
+          PAYLOAD=$(cat <<EOF
+          {
+            "text": "[${REPO_NAME}] ${DEPLOY_STATUS} (${SHORT_SHA})",
+            "attachments": [
+              {
+                "color": "${COLOR}",
+                "title": "${TITLE}",
+                "text": "${BODY}"
+              }
+            ]
+          }
+          EOF
+          )
+
+          curl -sS -X POST "$WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            --max-time 10 \
+            || echo "WARNING: Webhook notification failed (non-fatal)"

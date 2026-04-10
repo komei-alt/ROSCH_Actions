@@ -50,17 +50,21 @@ on:
       webhook_url:
         required: false
         type: string
-        description: "※非推奨(Secrets推奨) Slack互換の通知用 Webhook URL。デプロイ完了時に通知を送信します。"
+        description: "【非推奨: secrets.WEBHOOK_URL を使用してください】Slack互換の通知用 Webhook URL。"
     secrets:
       WEBHOOK_URL:
         required: false
         description: "Slack互換の通知用 Webhook URL。デプロイ完了時に通知を送信します。"
+      ROSCH_DEFAULT_WEBHOOK_URL:
+        required: false
+        description: "Organization デフォルトの Webhook URL。個別の WEBHOOK_URL が未設定時にフォールバックします。"
 
 jobs:
   deploy:
     runs-on: [self-hosted, nas]
     timeout-minutes: 30
     steps:
+      # ─── Phase: Setup ────────────────────────────────────────
       - name: Debounce
         if: ${{ inputs.deploy_delay > 0 }}
         run: |
@@ -83,6 +87,7 @@ jobs:
         if: ${{ inputs.pre_deploy_script != '' }}
         run: ${{ inputs.pre_deploy_script }}
 
+      # ─── Phase: Sync & Build ─────────────────────────────────
       - name: Ensure Disk Space
         run: |
           DEPLOY_DIR="${{ inputs.deploy_dir }}"
@@ -126,7 +131,6 @@ jobs:
       - name: Save Rollback Images
         working-directory: ${{ inputs.compose_dir }}
         run: |
-          # Tag current images as :rollback before building new ones
           for img in $(docker compose config --images 2>/dev/null); do
             if docker image inspect "$img" > /dev/null 2>&1; then
               docker tag "$img" "${img%:*}:rollback" 2>/dev/null || true
@@ -143,18 +147,20 @@ jobs:
         working-directory: ${{ inputs.compose_dir }}
         run: ${{ inputs.post_build_script }}
 
-      - name: Swap Container (Clean Network)
+      # ─── Phase: Deploy ───────────────────────────────────────
+      - name: Swap Container
         working-directory: ${{ inputs.compose_dir }}
         run: |
           docker compose down
           docker compose up -d
 
+      # ─── Phase: Verify ──────────────────────────────────────
       - name: Health Check
+        id: health
         if: ${{ inputs.health_url != '' }}
         working-directory: ${{ inputs.compose_dir }}
         run: |
           HEALTH_URL="${{ inputs.health_url }}"
-          CONTAINER_NAME="${{ inputs.container_name }}"
           for i in 1 2 3 4 5 6; do
             sleep 5
             HTTP_STATUS=$(curl -sL -o /dev/null -w "%{http_code}" "$HEALTH_URL" 2>/dev/null || echo "000")
@@ -165,9 +171,13 @@ jobs:
             echo "Health check attempt $i: HTTP $HTTP_STATUS"
           done
           echo "ERROR: Health check failed after 30s"
-          docker logs "$CONTAINER_NAME" --tail 30
+          docker logs "${{ inputs.container_name }}" --tail 30
+          exit 1
 
-          # Rollback: restore previous images and restart
+      - name: Rollback on Failure
+        if: ${{ failure() && inputs.health_url != '' }}
+        working-directory: ${{ inputs.compose_dir }}
+        run: |
           echo "--- Rollback: restoring previous images ---"
           ROLLED_BACK=false
           for img in $(docker compose config --images 2>/dev/null); do
@@ -181,14 +191,24 @@ jobs:
           if [ "$ROLLED_BACK" = true ]; then
             docker compose down
             docker compose up -d
+            sleep 5
+            # Verify rollback health
+            HTTP_STATUS=$(curl -sL -o /dev/null -w "%{http_code}" "${{ inputs.health_url }}" 2>/dev/null || echo "000")
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "Rollback health check OK (HTTP $HTTP_STATUS)"
+            else
+              echo "WARNING: Rollback health check returned HTTP $HTTP_STATUS"
+            fi
             echo "Rollback complete. Previous version restored."
+          else
+            echo "WARNING: No rollback images found. Manual intervention required."
           fi
-          exit 1
 
+      # ─── Phase: Cleanup & Notify ─────────────────────────────
       - name: Garbage Collection
+        if: always()
         run: |
           docker container prune -f > /dev/null 2>&1 || true
-          # Keep images from last 24h to preserve rollback tags and other project caches
           docker image prune -af --filter "until=24h" > /dev/null 2>&1 || true
           docker builder prune -af > /dev/null 2>&1 || true
 
@@ -207,7 +227,6 @@ jobs:
             echo "=== Docker Compose Config Validation ==="
             cd "${{ inputs.compose_dir }}" 2>/dev/null && docker compose config --quiet 2>&1 || echo "(compose validation skipped)"
           } > /tmp/deploy_error_log.txt 2>&1
-          # GitHub Actions: multi-line output via file
           {
             echo "ERROR_LOG<<DEPLOY_ERROR_EOF"
             head -c 2000 /tmp/deploy_error_log.txt
@@ -218,9 +237,7 @@ jobs:
       - name: Notify Webhook
         if: always()
         env:
-          WEBHOOK_SECRET: ${{ secrets.WEBHOOK_URL }}
-          WEBHOOK_INPUT: ${{ inputs.webhook_url }}
-          DEFAULT_WEBHOOK_URL: 'https://os.rosch.co.jp/api/webhooks/incoming/tok_85e2f7c2f5bc4c7e7399b426ee09f067e430c4fa4ef3fd64'
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL || inputs.webhook_url || secrets.ROSCH_DEFAULT_WEBHOOK_URL }}
           ERROR_LOG: ${{ steps.error_ctx.outputs.ERROR_LOG }}
           DEPLOY_REPO: ${{ github.repository }}
           DEPLOY_CONTAINER: ${{ inputs.container_name }}
@@ -229,54 +246,4 @@ jobs:
           DEPLOY_RUN_ID: ${{ github.run_id }}
           DEPLOY_STATUS: ${{ job.status }}
           DEPLOY_COMMIT_MSG: ${{ github.event.head_commit.message }}
-        run: |
-          TARGET_URL="${WEBHOOK_SECRET:-${WEBHOOK_INPUT:-$DEFAULT_WEBHOOK_URL}}"
-          if [ -z "$TARGET_URL" ]; then
-            echo "No webhook URL configured. Skipping notification."
-            exit 0
-          fi
-
-          PAYLOAD=$(python3 -c "
-          import json, os
-
-          repo = os.environ['DEPLOY_REPO']
-          repo_name = repo.split('/')[-1]
-          container = os.environ['DEPLOY_CONTAINER']
-          short_sha = os.environ['DEPLOY_SHA'][:7]
-          actor = os.environ['DEPLOY_ACTOR']
-          run_url = f'https://github.com/{repo}/actions/runs/{os.environ[\"DEPLOY_RUN_ID\"]}'
-          commit_msg = os.environ.get('DEPLOY_COMMIT_MSG', '').split('\n')[0][:80]
-          status = os.environ['DEPLOY_STATUS']
-
-          if status == 'success':
-              data = {
-                  'text': f'[{repo_name}] Deploy OK ({short_sha})',
-                  'attachments': [{
-                      'color': '#36a64f',
-                      'title': f'Deploy OK -- {repo_name}',
-                      'text': f'{repo_name} へのデプロイが完了しました。\n{commit_msg}\nby {actor} ({short_sha})'
-                  }]
-              }
-          else:
-              error_log = os.environ.get('ERROR_LOG', '') or '(no logs captured)'
-              if len(error_log) > 1500:
-                  error_log = error_log[:1500] + '\n... (truncated)'
-              data = {
-                  'text': f'[{repo_name}] Deploy FAILED ({short_sha})',
-                  'attachments': [
-                      {
-                          'color': '#dc3545',
-                          'title': f'Deploy FAILED -- {repo_name}',
-                          'text': f'{repo_name} のデプロイに失敗しました。\n{commit_msg}\nby {actor} ({short_sha})\nActions: {run_url}'
-                      },
-                      {
-                          'color': '#6c757d',
-                          'title': 'Error Logs',
-                          'text': error_log
-                      }
-                  ]
-              }
-          print(json.dumps(data, ensure_ascii=False))
-          ")
-          curl -sS -X POST -H 'Content-Type: application/json' -d "$PAYLOAD" "$TARGET_URL" || echo "Webhook notification failed."
-
+        run: python3 .github/scripts/deploy-notify.py

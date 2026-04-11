@@ -148,8 +148,33 @@ jobs:
       - name: Swap Container
         working-directory: ${{ inputs.compose_dir }}
         run: |
-          docker compose down
-          docker compose up -d
+          # Stop and remove containers (ignore errors from already-removed containers)
+          docker compose down --remove-orphans 2>/dev/null || true
+
+          # Clean up stale network endpoints that block container creation
+          # (happens after NAS restart when networks become inconsistent)
+          for net in $(docker compose config --format json 2>/dev/null | \
+                       python3 -c "import sys,json; d=json.load(sys.stdin); [print(n) for n in d.get('networks',{})]" 2>/dev/null); do
+            FULL_NET="${{ inputs.container_name }}_${net}"
+            if docker network inspect "$FULL_NET" > /dev/null 2>&1; then
+              echo "Disconnecting stale endpoints from $FULL_NET..."
+              for ep in $(docker network inspect "$FULL_NET" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null); do
+                docker network disconnect -f "$FULL_NET" "$ep" 2>/dev/null || true
+              done
+              docker network rm "$FULL_NET" 2>/dev/null || true
+            fi
+          done
+
+          # Also clean up any dangling networks
+          docker network prune -f > /dev/null 2>&1 || true
+
+          # Start containers
+          if ! docker compose up -d 2>&1; then
+            echo "First attempt failed. Force-removing container and retrying..."
+            docker rm -f "${{ inputs.container_name }}" 2>/dev/null || true
+            docker network prune -f > /dev/null 2>&1 || true
+            docker compose up -d
+          fi
 
       # --- Phase: Verify ---
       - name: Health Check
